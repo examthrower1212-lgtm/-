@@ -5,16 +5,26 @@ on:
     - cron: "*/5 * * * *"
 
   workflow_dispatch:
+    inputs:
+      send_test:
+        description: "Send Discord test message"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
+
+concurrency:
+  group: daejeon-dolby-alert
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Get code
+      - name: Download repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -22,10 +32,26 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install packages
+      - name: Install Python packages
         run: pip install -r requirements.txt
 
-      - name: Check Megabox
+      - name: Check Daejeon Dolby
         env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          WEBHOOK: ${{ secrets.WEBHOOK }}
+          TEST_MODE: ${{ github.event.inputs.send_test || 'false' }}
         run: python main.py
+
+      - name: Save alert state
+        run: |
+          if git diff --quiet -- state.json; then
+            echo "state.json has not changed."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add state.json
+          git commit -m "Update Dolby alert state"
+          git pull --rebase
+          git push
