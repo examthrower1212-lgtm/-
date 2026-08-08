@@ -1,4 +1,10 @@
 {
-  "initialized": false,
-  "seen_dates": []
+  "initialized": true,
+  "seen_dates": [
+    "20260809",
+    "20260810",
+    "20260811",
+    "20260812",
+    "20260813"
+  ]
 }
