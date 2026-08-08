@@ -1,5 +1,6 @@
 import json
 import os
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -8,11 +9,15 @@ import requests
 
 
 # =========================================================
-# 기본 설정
+# 설정
 # =========================================================
 
 BRANCH_CODE = "0028"       # 대전신세계아트앤사이언스
 THEATER_CODE = "DBC"       # Dolby Cinema
+
+# ""이면 돌비 전체 영화 감시
+# "오디세이"라고 쓰면 영화명에 '오디세이'가 들어간 회차만 알림
+TARGET_KEYWORD = ""
 
 STATE_FILE = Path("state.json")
 
@@ -30,7 +35,7 @@ BOOKING_URL = "https://www.megabox.co.kr/booking"
 
 
 # =========================================================
-# Discord 알림
+# 기본 도구
 # =========================================================
 
 def send_discord(message):
@@ -38,7 +43,7 @@ def send_discord(message):
 
     if not webhook_url:
         raise RuntimeError(
-            "WEBHOOK 환경변수가 없습니다. GitHub Secret 설정을 확인하세요."
+            "WEBHOOK 환경변수가 없습니다. GitHub Secret을 확인하세요."
         )
 
     response = requests.post(
@@ -50,14 +55,7 @@ def send_discord(message):
     response.raise_for_status()
 
 
-# =========================================================
-# 메가박스 조회
-# =========================================================
-
-def get_dolby_dates():
-    now = datetime.now(ZoneInfo("Asia/Seoul"))
-    today = now.strftime("%Y%m%d")
-
+def make_session():
     session = requests.Session()
 
     user_agent = (
@@ -66,27 +64,24 @@ def get_dolby_dates():
         "Chrome/140.0.0.0 Safari/537.36"
     )
 
-    # 먼저 메가박스 페이지에 접속하여 세션/쿠키 생성
+    session.headers.update({
+        "User-Agent": user_agent,
+        "Accept-Language": "ko-KR,ko;q=0.9",
+    })
+
+    # 메가박스 세션/쿠키 생성
     session.get(
         BOOKING_PAGE,
-        params={
-            "rpstMovieNo": "",
-            "theabKindCode1": THEATER_CODE,
-            "brchNo1": BRANCH_CODE,
-            "sellChnlCd": "",
-            "playDe": today,
-            "naverPlaySchdlNo": "",
-        },
-        headers={
-            "User-Agent": user_agent,
-            "Accept-Language": "ko-KR,ko;q=0.9",
-        },
         timeout=20,
     )
 
+    return session
+
+
+def request_megabox(session, play_date):
     payload = {
         "arrMovieNo": "",
-        "playDe": today,
+        "playDe": play_date,
 
         "brchNoListCnt": 1,
 
@@ -118,11 +113,9 @@ def get_dolby_dates():
 
     headers = {
         "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "ko-KR,ko;q=0.9",
         "Content-Type": "application/json; charset=UTF-8",
         "Origin": "https://www.megabox.co.kr",
         "Referer": BOOKING_PAGE,
-        "User-Agent": user_agent,
         "X-Requested-With": "XMLHttpRequest",
     }
 
@@ -135,48 +128,220 @@ def get_dolby_dates():
 
     response.raise_for_status()
 
-    # 메가박스 응답이 BOM을 포함하는 경우까지 처리
     text = response.content.decode("utf-8-sig")
-    data = json.loads(text)
 
-    movie_dates = data.get("movieFormDeList") or []
+    return json.loads(text)
 
-    dates = sorted(
-        {
-            str(item.get("playDe"))
-            for item in movie_dates
-            if item.get("playDe")
-            and str(item.get("playDe")) >= today
-        }
+
+def get_list(data, key):
+    """
+    메가박스 응답 구조가 약간 달라져도
+    top-level / megaMap 양쪽을 모두 확인합니다.
+    """
+
+    if key in data:
+        return data.get(key) or []
+
+    mega_map = data.get("megaMap") or {}
+
+    return mega_map.get(key) or []
+
+
+# =========================================================
+# 상영 날짜 조회
+# =========================================================
+
+def get_available_dates(session):
+    today = datetime.now(
+        ZoneInfo("Asia/Seoul")
+    ).strftime("%Y%m%d")
+
+    data = request_megabox(
+        session,
+        today,
     )
 
-    print(f"메가박스 응답에서 발견된 미래 날짜: {dates}")
+    date_items = get_list(
+        data,
+        "movieFormDeList",
+    )
+
+    dates = sorted({
+        str(item.get("playDe"))
+        for item in date_items
+        if item.get("playDe")
+        and str(item.get("playDe")) >= today
+    })
 
     if not dates:
-        print(f"응답의 주요 항목: {list(data.keys())}")
         raise RuntimeError(
-            "대전신세계 돌비 예매 날짜를 하나도 찾지 못했습니다."
+            "대전신세계 돌비 상영 날짜를 찾지 못했습니다."
         )
+
+    print(
+        f"조회 가능한 날짜: {dates}"
+    )
 
     return dates
 
 
 # =========================================================
-# 상태 저장 / 읽기
+# 상영회차 조회
+# =========================================================
+
+def normalize_time(value):
+    value = str(value or "").strip()
+
+    # 1030 → 10:30
+    if len(value) == 4 and value.isdigit():
+        return f"{value[:2]}:{value[2:]}"
+
+    # 이미 10:30 형태라면 그대로 사용
+    return value
+
+
+def get_all_sessions():
+    session = make_session()
+
+    dates = get_available_dates(session)
+
+    sessions = []
+
+    for date in dates:
+        data = request_megabox(
+            session,
+            date,
+        )
+
+        movie_list = get_list(
+            data,
+            "movieFormList",
+        )
+
+        print(
+            f"{date}: {len(movie_list)}개 회차 발견"
+        )
+
+        for item in movie_list:
+
+            play_schedule_no = str(
+                item.get("playSchdlNo") or ""
+            ).strip()
+
+            movie_name = str(
+                item.get("movieNm")
+                or item.get("rpstMovieNm")
+                or "영화명 없음"
+            ).strip()
+
+            play_date = str(
+                item.get("playDe")
+                or date
+            ).strip()
+
+            start_time = normalize_time(
+                item.get("playStartTime")
+            )
+
+            end_time = normalize_time(
+                item.get("playEndTime")
+            )
+
+            theater_name = str(
+                item.get("theabExpoNm")
+                or ""
+            ).strip()
+
+            # 필요하다면 특정 영화만 필터링 가능
+            if (
+                TARGET_KEYWORD
+                and TARGET_KEYWORD.lower()
+                not in movie_name.lower()
+            ):
+                continue
+
+            # 정상적으로는 playSchdlNo가 존재함.
+            # 혹시 없을 때를 대비한 fallback ID.
+            if play_schedule_no:
+                session_id = play_schedule_no
+            else:
+                session_id = (
+                    f"{play_date}|"
+                    f"{movie_name}|"
+                    f"{start_time}|"
+                    f"{theater_name}"
+                )
+
+            sessions.append({
+                "id": session_id,
+                "playSchdlNo": play_schedule_no,
+                "date": play_date,
+                "movie": movie_name,
+                "start": start_time,
+                "end": end_time,
+                "theater": theater_name,
+            })
+
+    if not sessions:
+        raise RuntimeError(
+            "돌비 상영회차를 하나도 찾지 못했습니다."
+        )
+
+    # 혹시 같은 회차가 중복으로 들어올 경우 제거
+    unique_sessions = {
+        item["id"]: item
+        for item in sessions
+    }
+
+    sessions = list(
+        unique_sessions.values()
+    )
+
+    sessions.sort(
+        key=lambda x: (
+            x["date"],
+            x["start"],
+            x["movie"],
+        )
+    )
+
+    print(
+        f"총 {len(sessions)}개 돌비 회차 확인"
+    )
+
+    return sessions
+
+
+# =========================================================
+# state.json
 # =========================================================
 
 def load_state():
     if not STATE_FILE.exists():
         return {
             "initialized": False,
-            "seen_dates": [],
+            "seen_sessions": [],
         }
 
     with STATE_FILE.open(
         "r",
         encoding="utf-8",
     ) as f:
-        return json.load(f)
+        state = json.load(f)
+
+    # 기존 날짜 기반 state.json 자동 변환
+    if "seen_sessions" not in state:
+        print(
+            "기존 날짜 기반 state.json을 "
+            "회차 기반 방식으로 전환합니다."
+        )
+
+        return {
+            "initialized": False,
+            "seen_sessions": [],
+        }
+
+    return state
 
 
 def save_state(state):
@@ -193,16 +358,92 @@ def save_state(state):
 
 
 # =========================================================
-# 날짜 표시
+# 표시용 함수
 # =========================================================
 
 def pretty_date(date_string):
-    dt = datetime.strptime(
-        date_string,
-        "%Y%m%d",
-    )
+    try:
+        dt = datetime.strptime(
+            date_string,
+            "%Y%m%d",
+        )
 
-    return dt.strftime("%Y년 %m월 %d일")
+        weekday = [
+            "월", "화", "수", "목",
+            "금", "토", "일"
+        ][dt.weekday()]
+
+        return (
+            f"{dt.year}년 "
+            f"{dt.month}월 "
+            f"{dt.day}일 ({weekday})"
+        )
+
+    except ValueError:
+        return date_string
+
+
+# =========================================================
+# Discord 신규회차 알림
+# =========================================================
+
+def notify_new_sessions(new_sessions):
+
+    # 날짜 + 영화별로 묶음
+    groups = defaultdict(list)
+
+    for session in new_sessions:
+        key = (
+            session["date"],
+            session["movie"],
+        )
+
+        groups[key].append(session)
+
+    for (date, movie), group in sorted(
+        groups.items()
+    ):
+
+        group.sort(
+            key=lambda x: x["start"]
+        )
+
+        times = " / ".join(
+            item["start"]
+            for item in group
+        )
+
+        theater_names = {
+            item["theater"]
+            for item in group
+            if item["theater"]
+        }
+
+        theater_text = ""
+
+        if theater_names:
+            theater_text = (
+                "\n🎦 "
+                + ", ".join(
+                    sorted(theater_names)
+                )
+            )
+
+        message = (
+            "🚨 **대전신세계 돌비 신규 회차 오픈**\n\n"
+            f"📅 **{pretty_date(date)}**\n"
+            f"🎬 **{movie}**\n"
+            f"🕒 **{times}**"
+            f"{theater_text}\n\n"
+            f"🎟️ {BOOKING_URL}"
+        )
+
+        send_discord(message)
+
+        print(
+            f"알림 전송: "
+            f"{date} / {movie} / {times}"
+        )
 
 
 # =========================================================
@@ -211,7 +452,6 @@ def pretty_date(date_string):
 
 def main():
 
-    # Discord 연결 테스트 모드
     test_mode = os.environ.get(
         "TEST_MODE",
         "false",
@@ -220,84 +460,92 @@ def main():
     if test_mode == "true":
         send_discord(
             "✅ **대돌비 알리미 테스트 성공**\n"
-            "GitHub Actions와 Discord Webhook이 정상적으로 연결되었습니다."
+            "GitHub Actions와 Discord Webhook이 "
+            "정상적으로 연결되었습니다."
         )
 
-        print("Discord 테스트 메시지를 전송했습니다.")
+        print("Discord 테스트 성공")
         return
 
-    # 현재 대전신세계 Dolby 예매 날짜 조회
-    current_dates = get_dolby_dates()
+    current_sessions = get_all_sessions()
 
     state = load_state()
 
-    # 최초 실행
-    # 현재 열린 날짜를 기준값으로 저장하되 알림은 보내지 않음
+    current_ids = {
+        item["id"]
+        for item in current_sessions
+    }
+
+    # 회차 기반 감시를 처음 시작하는 경우
+    # 현재 존재하는 모든 회차를 기준값으로 저장
     if not state.get("initialized", False):
 
-        state = {
+        save_state({
             "initialized": True,
-            "seen_dates": current_dates,
-        }
-
-        save_state(state)
+            "seen_sessions": sorted(
+                current_ids
+            ),
+        })
 
         print(
-            "최초 실행입니다. "
-            "현재 예매 날짜를 기준값으로 저장했습니다."
+            "회차 단위 감시를 처음 시작합니다."
+        )
+
+        print(
+            f"현재 {len(current_ids)}개 회차를 "
+            "기준값으로 저장했습니다."
+        )
+
+        print(
+            "최초 실행이므로 Discord 알림은 보내지 않습니다."
         )
 
         return
 
-    seen_dates = set(
-        state.get("seen_dates", [])
+    seen_ids = set(
+        state.get(
+            "seen_sessions",
+            [],
+        )
     )
 
-    current_set = set(current_dates)
-
-    # 이전에 없었던 새 날짜
-    new_dates = sorted(
-        current_set - seen_dates
+    new_ids = (
+        current_ids - seen_ids
     )
 
-    if not new_dates:
-        print("새로운 예매 날짜가 없습니다.")
-        return
-
-    pretty_dates = [
-        pretty_date(date)
-        for date in new_dates
+    new_sessions = [
+        item
+        for item in current_sessions
+        if item["id"] in new_ids
     ]
 
-    date_text = "\n".join(
-        f"• {date}"
-        for date in pretty_dates
-    )
+    if not new_sessions:
+        print(
+            "새로운 돌비 상영회차가 없습니다."
+        )
 
-    message = (
-        "🚨 **대전신세계 돌비 예매 오픈 감지**\n\n"
-        f"{date_text}\n\n"
-        "대전신세계아트앤사이언스 "
-        "DOLBY CINEMA에 새로운 예매 날짜가 추가되었습니다.\n\n"
-        f"🎟️ {BOOKING_URL}"
+        return
+
+    print(
+        f"신규 회차 {len(new_sessions)}개 발견!"
     )
 
     # Discord 전송
-    send_discord(message)
-
-    print(
-        f"새 날짜 감지 및 Discord 알림 완료: {new_dates}"
+    notify_new_sessions(
+        new_sessions
     )
 
-    # 알림 전송이 성공한 경우에만 기억
-    seen_dates.update(new_dates)
+    # Discord 전송 성공 후에만 기록
+    seen_ids.update(
+        new_ids
+    )
 
-    state = {
+    save_state({
         "initialized": True,
-        "seen_dates": sorted(seen_dates),
-    }
-
-    save_state(state)
+        "seen_sessions": sorted(
+            seen_ids
+        ),
+    })
 
 
 if __name__ == "__main__":
